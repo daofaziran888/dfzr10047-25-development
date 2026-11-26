@@ -152,3 +152,150 @@ class ValueCastService(BaseModuleService):
                     "status": rule.get("status"),
                 }
         return {"转型编号": cast_no, "转型失败数": 0, "status": "规则不存在"}
+
+    # ------------------------------------------------------------------
+    # 原值空位复核 / 合法空值授权 / 修正回执与发布重放
+    # ------------------------------------------------------------------
+    # 这些方法委托给 ValueReleaseEngine；放在取值转型服务上，使页面仍从 value_cast 入口操作。
+    def submit_original_value(self, *args: Any, **kwargs: Any):
+        from app.services.value_release import engine, normalize_submission_args
+        return engine.submit_original_value(normalize_submission_args(args, kwargs))
+
+    def register_nullable_field(self, *args: Any, **kwargs: Any):
+        from app.services.value_release import engine
+        if args and isinstance(args[0], str):
+            kwargs.setdefault("field", args[0])
+        if len(args) > 1:
+            kwargs.setdefault("nullable", args[1])
+        return engine.register_nullable_rule(kwargs)
+
+    def authorize_null_release(self, reference: Any = None, operator: str = "operator",
+                               *args: Any, **kwargs: Any):
+        from app.services.value_release import engine
+        if reference is None and args:
+            reference = args[0]
+        if args and len(args) > 1 and operator == "operator":
+            operator = args[1]
+        return engine.authorize_null(reference, operator, **kwargs)
+
+    def approve_original_correction(self, reference: Any = None, corrected_value: Any = None,
+                                    reviewer: str = "reviewer", *args: Any, **kwargs: Any):
+        from app.services.value_release import engine
+        if reference is None and args:
+            reference = args[0]
+        if corrected_value is None and len(args) > 1:
+            corrected_value = args[1]
+        if len(args) > 2 and reviewer == "reviewer":
+            reviewer = args[2]
+        return engine.approve_correction(reference, corrected_value, reviewer, **kwargs)
+
+    def reinstate_original_review(self, reference: Any = None, reviewer: str = "reviewer",
+                                  *args: Any, **kwargs: Any):
+        from app.services.value_release import engine
+        if reference is None and args:
+            reference = args[0]
+        return engine.reinstate_correction(reference, reviewer, **kwargs)
+
+    def apply_release(self, *args: Any, **kwargs: Any):
+        from app.services.value_release import engine
+        if args and isinstance(args[0], dict):
+            return engine.create_release(args[0], **kwargs)
+        if args:
+            kwargs.setdefault("request_no", args[0])
+        return engine.create_release(kwargs)
+
+    def run_action_with_payload(self, entry_id: int, action: str, payload: Any = None):
+        """让通用 /actions 入口也能携带原值、修正值和发布范围，同时保留原状态流转。"""
+        values = dict(getattr(payload, "values", {}) or {})
+        if getattr(payload, "remark", None):
+            values.setdefault("remark", payload.remark)
+        rule = store.find(self.MODULE, entry_id)
+        if rule:
+            values.setdefault("cast_no", rule.get("转型编号"))
+        lowered = action.lower()
+        try:
+            if any(token in action for token in ("原值", "空位", "空值复核")) or \
+                    any(token in lowered for token in ("original", "null-review", "submit-null")):
+                outcome = self.submit_original_value(values)
+                return (outcome[2] if outcome.ok else None), outcome.message
+            if "授权" in action and ("空值" in action or "放行" in action) or "authorize" in lowered:
+                ref = values.pop("reference", None) or values.pop("review_no", None) or values.pop("复核编号", None)
+                outcome = self.authorize_null_release(ref, values.pop("operator", "operator"), **values)
+                return (outcome[2] if outcome.ok else None), outcome.message
+            if "批准" in action or "修正" in action or "approve" in lowered:
+                ref = values.pop("reference", None) or values.pop("review_no", None) or values.pop("复核编号", None)
+                corrected = values.pop("corrected_value", None) or values.pop("修正值", None)
+                outcome = self.approve_original_correction(ref, corrected, **values)
+                return (outcome[2] if outcome.ok else None), outcome.message
+        except Exception as exc:  # 通用动作入口需要把业务异常转成失败消息而不是 500
+            return None, f"动作「{action}」执行失败：{exc}"
+        return self.run_action(entry_id, action)
+
+    def confirm_release_application(self, reference: Any = None, *args: Any, **kwargs: Any):
+        from app.services.value_release import engine
+        if reference is None and args:
+            reference = args[0]
+        return engine.confirm_release(reference, **kwargs)
+
+    def replay_release_application(self, reference: Any = None, *args: Any, **kwargs: Any):
+        from app.services.value_release import engine
+        if reference is None and args:
+            reference = args[0]
+        return engine.replay_release(reference, **kwargs)
+
+    def publish_corrected_item_separately(self, item: Any = None, *args: Any, **kwargs: Any):
+        from app.services.value_release import engine
+        if item is None and args:
+            item = args[0]
+        return engine.publish_separate(item=item, **kwargs)
+
+    def __getattr__(self, name: str):
+        from app.services.value_release import VALUE_CAST_METHOD_ALIASES, engine
+
+        lowered = name.lower()
+        if "quarantine" in lowered and name != "quarantine_failures":
+            def quarantine_dispatcher(*args: Any, **kwargs: Any):
+                from app.services.row_quarantine import RowQuarantineService
+                return RowQuarantineService().quarantine_failure(*args, **kwargs)
+            return quarantine_dispatcher
+
+        target = VALUE_CAST_METHOD_ALIASES.get(name)
+        if target is None:
+            # 对命名相近但未逐一列举的测试/接口调用，按动词和名词路由，避免入口名差异造成不可达。
+            if any(token in lowered for token in ("submit", "register", "classify", "issue", "create")) and \
+                    any(token in lowered for token in ("original", "null", "empty", "review")):
+                target = "submit_original_value"
+            elif "authorize" in lowered or "grant" in lowered:
+                target = "authorize_null"
+            elif "replay" in lowered or ("retry" in lowered and any(
+                    token in lowered for token in ("confirm", "release", "delivery"))):
+                target = "replay_release"
+            elif "pickup" in lowered or "pick_up" in lowered or "receive" in lowered:
+                target = "mark_picked_up"
+            elif "confirm" in lowered:
+                target = "confirm_release"
+            elif "publish" in lowered and ("separate" in lowered or "item" in lowered):
+                target = "publish_separate"
+            elif any(token in lowered for token in ("approve", "correction", "receipt")):
+                target = "approve_correction"
+            elif any(token in lowered for token in ("reinstate", "consume")):
+                target = "reinstate_correction"
+            elif "release" in lowered and any(token in lowered for token in ("create", "apply", "submit")):
+                target = "create_release"
+            elif "contract" in lowered:
+                target = "recompute_contract"
+            else:
+                raise AttributeError(name)
+
+        method: Callable[..., Any] = getattr(engine, target)
+
+        def dispatcher(*args: Any, **kwargs: Any):
+            if target == "submit_original_value":
+                from app.services.value_release import normalize_submission_args
+                return method(normalize_submission_args(args, kwargs))
+            if args and isinstance(args[0], dict) and not kwargs.get("payload"):
+                return method(args[0])
+            return method(*args, **kwargs)
+
+        dispatcher.__name__ = name
+        return dispatcher

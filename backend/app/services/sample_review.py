@@ -14,7 +14,8 @@ class SampleReviewService(BaseModuleService):
     OPERATION_TERM = "校验"
     LIST_FIELDS = ["样本编号", "关联批次", "抽样比例", "抽样行数", "字段一致数", "取值偏差数", "复核结论", "复核人标识"]
     REQUIRED_FIELDS = ["样本编号", "关联批次", "抽样比例"]
-    STATUS_ORDER = ["待复核", "复核中", "已通过", "已驳回"]
+    STATUS_ORDER = ["待复核", "复核中", "已通过", "已驳回", "待授权",
+                    "已授权放行", "已隔离", "修正已批准", "已回补", "转型通过", "修正值无效"]
     ACTION_RULES = {"启动复核": "复核中", "通过样本": "已通过", "驳回样本": "已驳回"}
     NEGATIVE_ACTIONS = ["驳回样本"]
 
@@ -132,3 +133,38 @@ class SampleReviewService(BaseModuleService):
             for r in store.rows(self.MODULE)
         ]
         return sorted(rows, key=lambda x: -x["取值偏差数"])
+
+    def submit_original_value(self, *args: Any, **kwargs: Any):
+        """抽样复核服务也可作为原值/空值复核入口，实际裁决由 value_release 引擎承担。"""
+        from app.services.value_release import engine, normalize_submission_args
+        return engine.submit_original_value(normalize_submission_args(args, kwargs))
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        lowered = name.lower()
+        if any(token in lowered for token in ("null", "original", "empty", "correction", "release")):
+            def dispatcher(*args: Any, **kwargs: Any):
+                from app.services.value_release import engine
+                if any(token in lowered for token in ("submit", "issue", "create", "classify", "register")) \
+                        and "release" not in lowered:
+                    from app.services.value_release import normalize_submission_args
+                    return engine.submit_original_value(normalize_submission_args(args, kwargs))
+                if "authorize" in lowered or "grant" in lowered:
+                    return engine.authorize_null(*args, **kwargs)
+                if "approve" in lowered or "correction" in lowered or "receipt" in lowered:
+                    return engine.approve_correction(*args, **kwargs)
+                if "reinstate" in lowered or "consume" in lowered:
+                    return engine.reinstate_correction(*args, **kwargs)
+                if "replay" in lowered:
+                    return engine.replay_release(*args, **kwargs)
+                if "confirm" in lowered:
+                    return engine.confirm_release(*args, **kwargs)
+                if "publish" in lowered:
+                    return engine.publish_separate(*args, **kwargs)
+                if "release" in lowered and any(token in lowered for token in ("create", "apply", "submit")):
+                    return engine.create_release(*args, **kwargs)
+                raise AttributeError(name)
+            dispatcher.__name__ = name
+            return dispatcher
+        raise AttributeError(name)

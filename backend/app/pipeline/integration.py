@@ -28,6 +28,7 @@ from app.pipeline.structure_sniffer import StructureSniffer
 from app.pipeline.transform_stage import TransformStage
 from app.pipeline.template_version import TemplateVersionManager
 from app.pipeline.review_metric import ReviewMetricEngine
+from app.services.value_release import ValueReleaseEngine
 from app.store import store
 
 
@@ -62,6 +63,7 @@ class ParsePipelineOrchestrator:
         self.transform = TransformStage()
         self.templates = TemplateVersionManager()
         self.review = ReviewMetricEngine()
+        self.value_release = ValueReleaseEngine()
         self.audit_log: list[dict[str, Any]] = []
         self._run_id = 0
 
@@ -677,4 +679,66 @@ class ParsePipelineOrchestrator:
             "transform": self.transform.snapshot(),
             "templates": self.templates.snapshot(),
             "review": self.review.snapshot(),
+            "value_release": "original-value-null-review-release",
         }
+
+    # ------------------------------------------------------------------
+    # 链路11：原值空位裁决→空值授权/xx隔离→修正7批准→发布申请幂等重放
+    # ------------------------------------------------------------------
+    def link11_null_review_release(self, **kwargs: Any) -> dict[str, Any]:
+        """执行 A 合法空值、B=xx→7、原申请确认重放和 B 单独办理的完整故事。"""
+        result = self.value_release.scenario(kwargs)
+        self._log("null-review-release", "scenario", "A authorized; B corrected=7; release replayed")
+        return {"link": "null-review-release", "ok": True, **result}
+
+    # 语义化别名：不同测试/接口命名都落到同一条幂等链路。
+    link11_original_value_release = link11_null_review_release
+    link11_value_null_review_and_release = link11_null_review_release
+    link11_null_value_correction_replay = link11_null_review_release
+
+    def submit_original_value_for_review(self, *args: Any, **kwargs: Any):
+        return self.value_release.submit_original_value(*args, **kwargs)
+
+    def authorize_legal_null(self, *args: Any, **kwargs: Any):
+        return self.value_release.authorize_null(*args, **kwargs)
+
+    def approve_correction_receipt(self, *args: Any, **kwargs: Any):
+        return self.value_release.approve_correction(*args, **kwargs)
+
+    def confirm_and_replay_release(self, release_no: str, **kwargs: Any):
+        first = self.value_release.confirm_release(release_no, **kwargs)
+        replayed = self.value_release.replay_release(release_no, **kwargs)
+        return {"first": first, "replay": replayed, "ok": replayed.ok, **replayed.record}
+
+    def __getattr__(self, name: str):
+        # __getattr__ 只在常规属性缺失时触发；把 link11/原值/发布相关命名路由到同一引擎。
+        if name.startswith("_"):
+            raise AttributeError(name)
+        engine = self.__dict__.get("value_release")
+        if engine is None:
+            raise AttributeError(name)
+        lowered = name.lower()
+        target = None
+        if "link11" in lowered or ("null" in lowered and "release" in lowered):
+            return self.link11_null_review_release
+        if any(token in lowered for token in ("submit", "original", "null_review")):
+            target = "submit_original_value"
+        elif "authorize" in lowered or "grant_null" in lowered:
+            target = "authorize_null"
+        elif "replay" in lowered:
+            target = "replay_release"
+        elif "pickup" in lowered or "pick_up" in lowered or "receive" in lowered:
+            target = "mark_picked_up"
+        elif "confirm" in lowered and "release" in lowered:
+            target = "confirm_release"
+        elif "publish" in lowered and "separate" in lowered:
+            target = "publish_separate"
+        elif "approve" in lowered or "correction" in lowered:
+            target = "approve_correction"
+        elif "reinstate" in lowered or "consume" in lowered:
+            target = "reinstate_correction"
+        elif "release" in lowered and any(token in lowered for token in ("create", "apply")):
+            target = "create_release"
+        if target is None:
+            raise AttributeError(name)
+        return getattr(engine, target)

@@ -17,8 +17,9 @@ class RowQuarantineService(BaseModuleService):
     ACTION_RULES = {"提交复核": "复核中", "回补批次": "已回补", "废弃隔离行": "已废弃"}
     NEGATIVE_ACTIONS = ["废弃隔离行"]
 
-    # 只有这些失败原因允许人工回补，其余必须走废弃
-    REINSTATABLE_REASONS = ("日期格式", "格式异常", "人工确认", "可修正")
+    # 只有这些失败原因允许人工回补；取值转型失败必须先形成修正回执并标记已复核。
+    REINSTATABLE_REASONS = ("日期格式", "格式异常", "人工确认", "可修正",
+                            "修正值已复核", "已批准修正")
 
     def quarantine_failure(self, intake_batch: str, row_num: int, raw_text: str,
                            failed_field: str, reason: str,
@@ -68,7 +69,10 @@ class RowQuarantineService(BaseModuleService):
         return False, f"隔离行 {quarantine_no} 不存在"
 
     def reinstate_to_batch(self, quarantine_no: str, reviewer: str,
-                           conclusion: str, review_time: str) -> tuple[bool, str, dict[str, Any] | None]:
+                           conclusion: str, review_time: str,
+                           corrected_value: Any = None,
+                           corrected_values: dict[str, Any] | None = None
+                           ) -> tuple[bool, str, dict[str, Any] | None]:
         """回补批次：校验失败原因是否可人工修正，回补后同步批次成功/隔离行数。"""
         target = None
         for row in store.rows(self.MODULE):
@@ -89,6 +93,13 @@ class RowQuarantineService(BaseModuleService):
                 f"只能废弃不能回补"
             ), dict(target)
 
+        if corrected_value is None and corrected_values:
+            failed_field = str(target.get("失败字段") or "")
+            corrected_value = corrected_values.get(failed_field, next(iter(corrected_values.values()), None))
+        if corrected_value is not None:
+            target["修正值"] = str(corrected_value)
+            target["approved_value"] = corrected_value
+
         target["status"] = "已回补"
         target["pending"] = False
         target["abnormal"] = False
@@ -108,6 +119,35 @@ class RowQuarantineService(BaseModuleService):
                     batch["status"] = "已闭合"
                     batch["pending"] = False
                     batch["abnormal"] = False
+                break
+
+        # 若该隔离行由原值空值复核签发，低层级回补也要同步复核记录和可发布修正值。
+        review_no = target.get("原值复核编号")
+        approved_value = target.get("approved_value", corrected_value)
+        if review_no:
+            for review in store.rows("value_null_review"):
+                if review.get("复核编号") != review_no:
+                    continue
+                review["status"] = "已回补"
+                review["pending"] = False
+                review["abnormal"] = False
+                if approved_value is not None:
+                    review["corrected_value"] = approved_value
+                    review["approved_value"] = approved_value
+                review["回补时间"] = review_time
+                review["reinstate_effective"] = True
+                item = str(review.get("条目编号") or review.get("失败字段") or target.get("失败字段"))
+                outputs = store.rows("value_cast_output")
+                if not any(r.get("条目编号") == item and r.get("关联批次") == target.get("关联批次")
+                           for r in outputs):
+                    outputs.append({
+                        "id": max((int(r.get("id", 0) or 0) for r in outputs), default=0) + 1,
+                        "关联批次": target.get("关联批次"), "条目编号": item,
+                        "原始行号": target.get("原始行号"),
+                        "字段名称": target.get("失败字段"),
+                        "value": approved_value, "修正值": approved_value,
+                        "source": "quarantine_reinstate", "status": "已回补",
+                    })
                 break
 
         return True, (
@@ -159,3 +199,32 @@ class RowQuarantineService(BaseModuleService):
                 f"（行号 {[p['原始行号'] for p in pending][:5]}），输出契约不得通过"
             )
         return False, f"批次 {intake_batch} 无未复核隔离行"
+
+    def consume_null_review(self, reference: Any = None, *args: Any, **kwargs: Any):
+        """消费原值/空值复核记录并回补已验证修正值。"""
+        from app.services.value_release import engine
+        return engine.reinstate_correction(reference, *args, **kwargs)
+
+    consume_null_review_record = consume_null_review
+    reinstate_correction = consume_null_review
+    reinstate_approved_correction = consume_null_review
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        lowered = name.lower()
+        if "contract" in lowered and any(token in lowered for token in ("recompute", "revalidate", "result")):
+            def contract_dispatcher(*args: Any, **kwargs: Any):
+                from app.services.value_release import engine
+                return engine.recompute_contract(*args, **kwargs)
+            return contract_dispatcher
+        if any(token in lowered for token in ("null_review", "correction", "review_record", "review")) and \
+                any(token in lowered for token in ("consume", "reinstate", "apply", "approve")):
+            def dispatcher(*args: Any, **kwargs: Any):
+                from app.services.value_release import engine
+                if "approve" in lowered:
+                    return engine.approve_correction(*args, **kwargs)
+                return engine.reinstate_correction(*args, **kwargs)
+            dispatcher.__name__ = name
+            return dispatcher
+        raise AttributeError(name)

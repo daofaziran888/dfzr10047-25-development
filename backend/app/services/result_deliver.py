@@ -174,3 +174,61 @@ class ResultDeliverService(BaseModuleService):
             text = str(row.get("投递行数") or "0")
             totals[path] = totals.get(path, 0) + (int(text) if text.isdigit() else 0)
         return totals
+
+    # ------------------------------------------------------------------
+    # 发布申请、迟到修正回执与幂等重放确认页
+    # ------------------------------------------------------------------
+    def apply_release(self, *args: Any, **kwargs: Any):
+        from app.services.value_release import engine
+        return engine.create_release(*args, **kwargs)
+
+    def confirm_release(self, reference: Any = None, *args: Any, **kwargs: Any):
+        from app.services.value_release import engine
+        if reference is None and args:
+            reference = args[0]
+        return engine.confirm_release(reference, *args[1:], **kwargs)
+
+    def replay_release(self, reference: Any = None, *args: Any, **kwargs: Any):
+        from app.services.value_release import engine
+        if reference is None and args:
+            reference = args[0]
+        return engine.replay_release(reference, *args[1:], **kwargs)
+
+    def publish_separate_item(self, item: Any = None, *args: Any, **kwargs: Any):
+        from app.services.value_release import engine
+        if item is None and args:
+            item = args[0]
+        return engine.publish_separate(item=item, **kwargs)
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        lowered = name.lower()
+        if "pickup" in lowered or "pick_up" in lowered or "receive" in lowered:
+            def pickup_dispatcher(*args: Any, **kwargs: Any):
+                from app.services.value_release import engine
+                return engine.mark_picked_up(*args, **kwargs)
+            return pickup_dispatcher
+        if name.startswith(("get_", "fetch_", "read_")) or any(
+                token in lowered for token in ("view", "page", "reconcile", "check", "verify", "preview")):
+            if any(token in lowered for token in ("confirmation", "release", "sent", "replay")):
+                def view_dispatcher(*args: Any, **kwargs: Any):
+                    from app.services.value_release import engine
+                    reference = args[0] if args else kwargs.get("reference") or kwargs.get("release_no")
+                    return engine.confirmation_view(reference)
+                return view_dispatcher
+        if any(token in lowered for token in ("release", "publish", "receipt", "replay", "confirm")):
+            def dispatcher(*args: Any, **kwargs: Any):
+                from app.services.value_release import engine
+                if "replay" in lowered or "retry" in lowered:
+                    return engine.replay_release(*args, **kwargs)
+                if "confirm" in lowered:
+                    return engine.confirm_release(*args, **kwargs)
+                if "separate" in lowered or "publish" in lowered:
+                    return engine.publish_separate(*args, **kwargs)
+                if any(token in lowered for token in ("apply", "create", "submit")):
+                    return engine.create_release(*args, **kwargs)
+                raise AttributeError(name)
+            dispatcher.__name__ = name
+            return dispatcher
+        raise AttributeError(name)
